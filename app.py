@@ -152,16 +152,13 @@ if st.button("Run Analysis") and uploaded_files and api_key:
         status_text.text(f"Processing {file.name}...")
         text = extract_text_from_pdf(file)
         if text:
-            # Rate limit handling
-            if i > 0 and i % 10 == 0:
-                status_text.text("❄️ API Cooling down (15s)...")
-                time.sleep(15)
-            
+            # FAST PROCESSING: Removed 15s sleep logic
             res = analyze_single_call(model, text)
             if res:
                 res['File Name'] = file.name
                 results.append(res)
-            time.sleep(2)
+            # Minimal pause to keep UI responsive
+            time.sleep(0.1) 
         progress_bar.progress((i + 1) / len(uploaded_files))
 
     if results:
