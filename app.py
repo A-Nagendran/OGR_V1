@@ -1,20 +1,41 @@
 import streamlit as st
-import google.generativeai as genai
-import PyPDF2
 import pandas as pd
 import io
 import time
 import json
 import re
+import os
+import subprocess
+import sys
+
+# --- AUTO-FIX FOR OLD LIBRARIES ---
+# This ensures the app doesn't crash on Streamlit Cloud or Local
+try:
+    import google.generativeai as genai
+    # Check if 'configure' exists. If not, trigger update.
+    if not hasattr(genai, 'configure'):
+        raise ImportError("Old version detected")
+except ImportError:
+    st.warning("⚠️ Updating Google AI Library... (This happens once)")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "google-generativeai"])
+    import google.generativeai as genai
+    st.success("✅ Library updated! Please rerun the app.")
+    st.stop()
+
+import PyPDF2
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="G.O.A.A. Sales Auditor (Live)", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="G.O.A.A. Sales Auditor", page_icon="🏖️", layout="wide")
 
 # --- SESSION STATE SETUP ---
 if "results_list" not in st.session_state:
     st.session_state.results_list = []
 if "processing_active" not in st.session_state:
     st.session_state.processing_active = False
+if "df_csm" not in st.session_state:
+    st.session_state.df_csm = None
+if "df_team" not in st.session_state:
+    st.session_state.df_team = None
 
 # --- HELPER FUNCTIONS ---
 def extract_text_from_pdf(file):
@@ -42,10 +63,10 @@ def analyze_single_call(model, text):
     4. **Offers:** Club Membership Waiver (~10L), Spot Offer (70k), Corpus Waiver (1.30L), Payment Plan (25:25:25:25).
     5. **Growth:** 3X appreciation in 7 years (Colliers Report).
 
-    **YOUR TASK: Extract the following fields based on the user's specific requirements.**
+    **YOUR TASK: Extract the following fields.**
 
     **1. Customer Priming (Yes/No):**
-       Check if the customer was aware of these BEFORE the core pitch started (did they mention being told by a pre-sales person?):
+       Was the customer told about these BEFORE the core pitch started?
        - Price Rise Awareness
        - Limited Inventory Awareness
        - Value of attending this call
@@ -53,25 +74,25 @@ def analyze_single_call(model, text):
 
     **2. Motivation & Tailoring:**
        - **Motivation Checked?** (Yes/No)
-       - **Identified Motivation:** (e.g., Rental Yield, Holiday Home, Capital Appreciation).
+       - **Identified Motivation:** (e.g., Rental Yield, Holiday Home, Appreciation).
        - **Tailored Pitch?** Did the CSM adapt the pitch based on this motivation? (Yes/No).
 
     **3. Objections (Bucketing):**
-       Mark "Yes" if the customer raised an objection in these categories:
+       Mark "Yes" if raised:
        - Price Related
        - Product Related (Size, specs)
-       - Location Related (Bicholim, distance from beach)
+       - Location Related (Bicholim, distance)
        - ROI Related (Yield, growth)
-       - Site Visit Related (Want to see before buying)
+       - Site Visit Related
        - Payment Terms Related
 
     **4. Q&A Log (Verbatim):**
-       List the specific questions/objections and the CSM's answers.
-       *Format:* "Cust: [Objection translated to English] -> CSM: [Answer translated to English]"
+       List specific questions/objections and answers.
+       *Format:* "Cust: [English Translation] -> CSM: [English Translation]"
 
     **5. Urgency Creation:**
        - **Urgency Established?** (Yes/No)
-       - **Closing Remarks/Tactics:** Describe how they pushed for the EOI/Application (e.g., "Only 2 units left", "Price increases tomorrow").
+       - **Closing Remarks:** How did they push for the EOI?
 
     **OUTPUT FORMAT:**
     Return a SINGLE line separated by '###' delimiters containing exactly these 18 fields:
@@ -99,39 +120,49 @@ def analyze_single_call(model, text):
     except: return None
 
 def generate_summaries(model, df):
-    if df.empty: return pd.DataFrame(), pd.DataFrame()
+    if df.empty: return None, None
     csv_data = df.to_csv(index=False)
+    
     prompt = f"""
     You are the Sales Training Head at HoABL. Summarize these G.O.A.A. sales calls.
     Data: {csv_data}
-    **STRICT RULE:** 100% English Output.
+    
+    **STRICT RULE:** 100% English Output. No Hindi.
+
     **TASK 1: CSM SUMMARY** (JSON list of objects: "CSM Name", "Strengths", "Areas of Improvement", "Specific Instances")
     **TASK 2: TEAM SUMMARY** (JSON list of strings: "Team Performance Insights")
+
     Return strictly Valid JSON: {{ "CSM_Summaries": [], "Team_Summary": [] }}
     """
     try:
         response = model.generate_content(prompt)
-        match = re.search(r'\{.*\}', response.text.strip(), re.DOTALL)
-        data = json.loads(match.group(0)) if match else json.loads(response.text.strip())
+        # Robust JSON Extraction
+        text = response.text.strip()
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        json_str = match.group(0) if match else text.replace("```json", "").replace("```", "")
+        data = json.loads(json_str)
+        
         return pd.DataFrame(data.get("CSM_Summaries", [])), pd.DataFrame(data.get("Team_Summary", []), columns=["Team Performance Insights"])
     except:
-        return pd.DataFrame(), pd.DataFrame()
+        return None, None
 
 # --- MAIN UI ---
-st.title("⚡ G.O.A.A. Live Sales Auditor")
+st.title("🏖️ G.O.A.A. Sales Auditor")
 
 with st.sidebar:
     api_key = st.text_input("Enter Gemini API Key", type="password")
     uploaded_files = st.file_uploader("Upload Transcripts (PDF)", type=['pdf'], accept_multiple_files=True)
     
     if st.button("Start Processing"):
-        st.session_state.results_list = [] # Reset on new run
+        st.session_state.results_list = [] 
+        st.session_state.df_csm = None
+        st.session_state.df_team = None
         st.session_state.processing_active = True
 
-# --- LIVE DASHBOARD ---
+# --- PROCESS LOGIC ---
 status_container = st.container()
-table_container = st.empty()
-summary_container = st.container()
+tab1, tab2, tab3 = st.tabs(["Analysis (Live)", "CSM Summary", "Team Stats"])
+table_placeholder = tab1.empty()
 
 if st.session_state.processing_active and uploaded_files and api_key:
     genai.configure(api_key=api_key)
@@ -141,60 +172,71 @@ if st.session_state.processing_active and uploaded_files and api_key:
         progress_bar = status_container.progress(0)
         status_text = status_container.empty()
         
-        # MAIN LOOP
+        # 1. ANALYZE FILES
         for i, file in enumerate(uploaded_files):
-            # Check if already processed (duplicates)
-            if any(d['File Name'] == file.name for d in st.session_state.results_list):
+            # Skip duplicates
+            if any(d.get('File Name') == file.name for d in st.session_state.results_list):
                 continue
                 
-            status_text.text(f"⏳ Analyzing: {file.name} ({i+1}/{len(uploaded_files)})")
-            
+            status_text.text(f"⏳ Analyzing: {file.name}...")
             text = extract_text_from_pdf(file)
+            
             if text:
                 res = analyze_single_call(model, text)
                 if res:
                     res['File Name'] = file.name
                     st.session_state.results_list.append(res)
                     
-                    # LIVE UPDATE
-                    df_live = pd.DataFrame(st.session_state.results_list)
-                    table_container.dataframe(df_live, use_container_width=True)
+                    # Update Table Live
+                    table_placeholder.dataframe(pd.DataFrame(st.session_state.results_list))
             
+            # Update Progress
             progress_bar.progress((i + 1) / len(uploaded_files))
-            time.sleep(0.1) # Brief pause for UI refresh
+            time.sleep(0.1) # Fast processing for Tier 1
 
-        status_text.success("✅ All files processed!")
-        st.session_state.processing_active = False # Stop processing state
+        st.session_state.processing_active = False 
+        status_text.success("✅ File Analysis Complete! Generating Summaries...")
         
-        # GENERATE SUMMARIES AFTER LOOP
-        with st.spinner("🧠 Generating Management Reports..."):
-            df_final = pd.DataFrame(st.session_state.results_list)
-            df_csm, df_team = generate_summaries(model, df_final)
-            
-            # Display Summaries
-            with summary_container:
-                tab_a, tab_b = st.tabs(["CSM Summary", "Team Stats"])
-                tab_a.dataframe(df_csm, use_container_width=True)
-                tab_b.dataframe(df_team, use_container_width=True)
-
-            # DOWNLOAD BUTTON
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df_final.to_excel(writer, sheet_name='Analysis', index=False)
-                df_csm.to_excel(writer, sheet_name='CSM Summary', index=False)
-                df_team.to_excel(writer, sheet_name='Team Stats', index=False)
-            
-            st.download_button(
-                label="📥 Download Complete Report",
-                data=output.getvalue(),
-                file_name="GOAA_Full_Report.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+        # 2. GENERATE SUMMARIES
+        df_final = pd.DataFrame(st.session_state.results_list)
+        df_csm, df_team = generate_summaries(model, df_final)
+        
+        st.session_state.df_csm = df_csm
+        st.session_state.df_team = df_team
+        status_text.empty() # Clear status
+        progress_bar.empty()
 
     except Exception as e:
         status_container.error(f"Error: {e}")
 
-# --- FALLBACK DISPLAY (If page refreshes but data exists) ---
-elif st.session_state.results_list:
-    st.info("Showing previous results.")
-    st.dataframe(pd.DataFrame(st.session_state.results_list))
+# --- DISPLAY RESULTS ---
+if st.session_state.results_list:
+    # Tab 1 is updated live above, forcing refresh here just in case
+    table_placeholder.dataframe(pd.DataFrame(st.session_state.results_list))
+
+    with tab2:
+        if st.session_state.df_csm is not None:
+            st.dataframe(st.session_state.df_csm, use_container_width=True)
+        else:
+            st.info("Waiting for completion...")
+
+    with tab3:
+        if st.session_state.df_team is not None:
+            st.dataframe(st.session_state.df_team, use_container_width=True)
+        else:
+            st.info("Waiting for completion...")
+
+    # EXCEL DOWNLOAD
+    if st.session_state.df_csm is not None:
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            pd.DataFrame(st.session_state.results_list).to_excel(writer, sheet_name='Analysis', index=False)
+            st.session_state.df_csm.to_excel(writer, sheet_name='CSM Summary', index=False)
+            st.session_state.df_team.to_excel(writer, sheet_name='Team Stats', index=False)
+        
+        st.download_button(
+            label="📥 Download Final Report",
+            data=output.getvalue(),
+            file_name="GOAA_Sales_Report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
