@@ -8,7 +8,7 @@ import json
 import re
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="G.O.A.A. Sales Auditor (Debug Mode)", page_icon="🛠️", layout="wide")
+st.set_page_config(page_title="G.O.A.A. Sales Auditor", page_icon="🏖️", layout="wide")
 
 # --- SESSION STATE ---
 if "results_list" not in st.session_state:
@@ -19,7 +19,31 @@ if "logs" not in st.session_state:
 # --- HELPER FUNCTIONS ---
 def log_message(msg):
     st.session_state.logs.append(msg)
-    # Force UI update for log (optional, but keeps it reactive)
+
+def get_best_model():
+    """Automatically finds the best available Gemini model to avoid 404 errors."""
+    try:
+        # Get all models that support content generation
+        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        
+        # Priority 1: Flash (Fast & Cheap)
+        for m in available_models:
+            if 'flash' in m.lower() and '1.5' in m:
+                return m
+        
+        # Priority 2: Pro (Powerful)
+        for m in available_models:
+            if 'pro' in m.lower() and '1.5' in m:
+                return m
+                
+        # Priority 3: Any Gemini model
+        for m in available_models:
+            if 'gemini' in m.lower():
+                return m
+                
+        return 'models/gemini-pro' # Fallback
+    except Exception as e:
+        return 'models/gemini-1.5-flash' # Default Fallback
 
 def extract_text_from_pdf(file):
     try:
@@ -87,7 +111,6 @@ def analyze_single_call(model, text, filename):
         response = model.generate_content(prompt)
         parts = [x.strip() for x in response.text.strip().split('###')]
         
-        # Data validation
         if len(parts) < 5:
             log_message(f"⚠️ {filename}: AI returned incomplete data.")
             return None
@@ -135,7 +158,7 @@ def generate_summaries(model, df):
         return pd.DataFrame(), pd.DataFrame()
 
 # --- UI LAYOUT ---
-st.title("🛠️ G.O.A.A. Sales Auditor (Debug Mode)")
+st.title("🛠️ G.O.A.A. Sales Auditor (Smart Model Select)")
 
 # Sidebar
 with st.sidebar:
@@ -148,7 +171,6 @@ status_area = st.empty()
 progress_bar = st.progress(0)
 tab1, tab2, tab3, tab4 = st.tabs(["📊 Analysis (Live)", "👨‍🏫 CSM Summary", "📈 Team Stats", "📝 Debug Logs"])
 
-# Placeholders for live updates
 with tab1: table_placeholder = st.empty()
 with tab2: csm_placeholder = st.empty()
 with tab3: team_placeholder = st.empty()
@@ -160,12 +182,18 @@ if start_btn and uploaded_files and api_key:
     st.session_state.results_list = []
     st.session_state.logs = []
     
-    genai.configure(api_key=api_key)
     try:
-        model = genai.GenerativeModel('models/gemini-1.5-flash')
+        genai.configure(api_key=api_key)
+        
+        # --- AUTO MODEL SELECTOR ---
+        status_area.info("🔍 Finding best available Gemini model...")
+        best_model_name = get_best_model()
+        model = genai.GenerativeModel(best_model_name)
+        status_area.success(f"✅ Connected using model: {best_model_name}")
+        time.sleep(1)
         
         total = len(uploaded_files)
-        log_message(f"🚀 Started processing {total} files...")
+        log_message(f"🚀 Started processing {total} files using {best_model_name}...")
         
         for i, file in enumerate(uploaded_files):
             status_area.text(f"⏳ Processing {i+1}/{total}: {file.name}")
